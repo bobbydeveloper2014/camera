@@ -10,11 +10,12 @@ from datetime import timedelta
 from flask_session import Session
 from flask_sqlalchemy import SQLAlchemy
 devices = {}
+user_sockets = {}  # <--- thêm dòng này
 app = Flask(__name__)
 app.secret_key = 'super_secure_key_here'  
 app.permanent_session_lifetime = timedelta(minutes=50000)  
 socketio = SocketIO(app, cors_allowed_origins="*", logger=True, engineio_logger=True)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql://root:nhim1234@127.0.0.1:3306/camera_app?charset=utf8mb4'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql://root:@127.0.0.1:3306/camera_app?charset=utf8mb4'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SESSION_TYPE'] = 'sqlalchemy'
 app.config['SESSION_SQLALCHEMY'] = SQLAlchemy(app)  
@@ -28,7 +29,7 @@ def get_db_connection():
     return mysql.connector.connect(
         host='localhost',
         user='root',
-        password='nhim1234',
+        password='',
         database='camera_app'
     )
 
@@ -154,82 +155,47 @@ def handle_candidate(data):
         emit('candidate', data, room=room, broadcast=True)  # fallback
 
 @socketio.on('connect')
-def handle_connect():
-    print(f"Client {request.sid} connected")
+def connect():
+    uid = str(session.get('user_id', ''))
+    print(f"✅ Connected {uid} SID={request.sid}")
+    if uid:
+        user_sockets[uid] = request.sid
+        join_room(uid)
+
 @socketio.on('disconnect')
-def handle_disconnect():
-    for device_id, sid in list(devices.items()):
+def disconnect():
+    for d, sid in list(devices.items()):
         if sid == request.sid:
-            print(f"❌ Device {device_id} disconnected")
-            del devices[device_id]
+            del devices[d]
+    for u, sid in list(user_sockets.items()):
+        if sid == request.sid:
+            del user_sockets[u]
+    print(f"❌ Disconnected {request.sid}")
+
 @socketio.on('register_device')
 def register_device(data):
-    # Kiểm tra dữ liệu đầu vào có hợp lệ không
-    if 'device_id' not in data:
-        print("❌ Thiếu device_id trong dữ liệu gửi lên")
-        emit('device_status', {'device_id': None, 'is_camera': True, 'error': 'Thiếu device_id'})
-        return
+    did = str(data['device_id'])
+    devices[did] = request.sid
+    join_room(did)
+    print(f"📡 Device {did} online")
 
-    device_id = data['device_id']
-    print(f"📥 Received register request for device_id: {device_id}")
-
-    # Ghi nhận socket ID hiện tại (request.sid) cho device_id này
-    devices[device_id] = request.sid
-    print(f"✅ Device {device_id} registered with SID {request.sid}")
-
-    # Kết nối database kiểm tra device_id
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-
-        cursor.execute('SELECT * FROM device WHERE device_id = %s', (device_id,))
-        device = cursor.fetchone()
-
-        cursor.close()
-        conn.close()
-
-        if device:
-            is_camera = device['is_camera']
-            emit('device_status', {'device_id': device_id, 'is_camera': True})
-        else:
-            print(f"❌ Device {device_id} không tồn tại trong database")
-            emit('device_status', {'device_id': device_id, 'is_camera': True, 'error': 'Thiết bị không tồn tại hoặc chưa đăng ký'})
-    except Exception as e:
-        print(f"⚠️ Lỗi khi kiểm tra thiết bị: {e}")
-        emit('device_status', {'device_id': device_id, 'is_camera': True, 'error': 'Lỗi kiểm tra thiết bị'})
-@socketio.on('start_stream')
-def start_stream(data):
-    user_id = session.get('user_id')  # User hiện tại (lấy từ session sau khi đăng nhập)
-    device_id = data['device_id']
-
-    # Check quyền sở hữu thiết bị
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)  # Trả về dict thay vì tuple để dễ truy cập
-    try:
-        cursor.execute('SELECT user_id FROM device WHERE device_id = %s', (device_id,))
-        device = cursor.fetchone()
-    finally:
-        cursor.close()
-        conn.close()
-
-    if not device or device['user_id'] != user_id:
-        emit('error', {'message': 'Bạn không có quyền xem thiết bị này'})
-        return
-
-    if device_id not in devices:
-        emit('error', {'message': 'Thiết bị không online'})
-        print(f"⚠️ Thiết bị {device_id} không online. Danh sách hiện tại: {devices}")
-        return
-
-    print(f"📡 Current devices online: {devices}")
-    device_sid = devices[device_id]
-    emit('start_stream', {'device_id': device_id}, to=device_sid)  # Xóa camera_name
 @socketio.on('notify_view_camera')
-def handle_notify_view_camera(data):
-    device_id = data['device_id']
-    print(f'🔔 Notify all clients to register camera for device {device_id}')
+def notify_view_camera(data):
+    did = str(data['device_id'])
+    vid = str(data['viewer_id'])
+    print(f"🔔 Viewer {vid} yêu cầu xem {did}")
+    socketio.emit('register_camera_command', {'device_id': did, 'viewer_id': vid}, to=devices.get(did))
 
-    # Gửi cho tất cả client (broadcast)
-    socketio.emit('register_camera_command', {'device_id': device_id})
+@socketio.on('frame_binary')
+def frame_binary(data):
+    did = str(data['device_id'])
+    sid_sender = request.sid
+    tid = str(data['target_id'])
+    buf = data['frame']
+    print(f"📤 Frame {did} {sid_sender} → {tid}")
+    if tid in user_sockets:
+        emit('frame_to_viewer', {'frame': buf}, room=user_sockets[tid], binary=True)
+    else:
+        print(f"⚠️ Viewer {tid} not found")
 if __name__ == '__main__':
     socketio.run(app,host='0.0.0.0',certfile="localhost.crt", keyfile="localhost.key")

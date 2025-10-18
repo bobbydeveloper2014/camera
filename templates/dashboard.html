@@ -16,7 +16,7 @@
 
         <div class="mb-4">
             <a href="/add_device" class="btn btn-success">Thêm thiết bị</a>
-            <a href="{{ url_for('logout') }}">Đăng xuất</a>
+            <a href="{{ url_for('logout') }}" class="btn btn-danger">Đăng xuất</a>
         </div>
 
         <h3>Danh sách thiết bị</h3>
@@ -32,7 +32,8 @@
         </ul>
 
         <div id="stream-container" class="my-4" style="display:none;">
-            <video id="remote-video" width="640" height="360" autoplay playsinline></video>
+            <h4>Đang xem camera</h4>
+            <img id="viewer-image" width="640" height="360" alt="Camera stream sẽ hiển thị ở đây">
         </div>
 
         <div id="camera-container" class="my-4" style="display:none;">
@@ -41,168 +42,100 @@
         </div>
     </div>
 
-    <script>
-        const socket = io.connect('https://' + document.domain + ':' + location.port);
-        const userId = {{ session['user_id'] }};
-        const localVideo = document.getElementById('local-video');
-        const remoteVideo = document.getElementById('remote-video');
-        const streamContainer = document.getElementById('stream-container');
-        const cameraContainer = document.getElementById('camera-container');
+<script>
+const socket = io(window.location.origin, { transports: ['websocket'] });
+const userId = {{ session['user_id'] }};
+const localVideo = document.getElementById('local-video');
+const cameraContainer = document.getElementById('camera-container');
+const streamContainer = document.getElementById('stream-container');
+const viewerImage = document.getElementById('viewer-image');
+let localStream = null;
+let isCamera = false;
+let frameUrl = null;
 
-        const peerConnections = {};
-        let currentDeviceId = null;
-        let currentCameraId = null;
+socket.on('connect', () => {
+    console.log('✅ Socket connected:', socket.id);
+});
 
-        const iceServers = {
-            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-        };
+// Viewer nhấn "Xem camera"
+document.querySelectorAll('.start-stream').forEach(button => {
+    button.addEventListener('click', () => {
+        const deviceId = button.getAttribute('data-device-id');
+        console.log('📺 Viewer yêu cầu xem thiết bị:', deviceId);
+        socket.emit('notify_view_camera', { device_id: deviceId, viewer_id: String(userId) });
+        streamContainer.style.display = 'block';
+    });
+});
 
-        document.querySelectorAll('.start-stream').forEach(button => {
-            button.addEventListener('click', () => {
-                const deviceId = button.getAttribute('data-device-id');
-                currentDeviceId = deviceId;
-                startViewerStream(deviceId);
-                socket.emit('notify_view_camera', { device_id: deviceId, viewer_id: userId });
-            });
-        });
+// Server bảo camera bắt đầu phát
+socket.on('register_camera_command', data => {
+    console.log('📹 Server yêu cầu camera phát:', data);
+    cameraContainer.style.display = 'block';
+    startCamera(String(data.device_id), String(data.viewer_id));
+});
 
-        function getPeerConnection(deviceId) {
-            if (!peerConnections[deviceId]) {
-                peerConnections[deviceId] = new RTCPeerConnection(iceServers);
+// Viewer nhận frame từ server
+socket.on('frame_to_viewer', data => {
+    if (!data || !data.frame) return;
 
-                peerConnections[deviceId].onicecandidate = event => {
-                    if (event.candidate && currentCameraId) {
-                        socket.emit('candidate', {
-                            candidate: event.candidate,
-                            room: deviceId,
-                            target_id: currentCameraId
+    const buffer = data.frame;
+    if (!(buffer instanceof ArrayBuffer)) {
+        console.warn('⚠️ Frame không phải ArrayBuffer:', buffer);
+        return;
+    }
+
+    console.log('🎥 Nhận frame, kích thước:', buffer.byteLength);
+    const blob = new Blob([buffer], { type: 'image/jpeg' });
+    if (frameUrl) URL.revokeObjectURL(frameUrl);
+    frameUrl = URL.createObjectURL(blob);
+    viewerImage.src = frameUrl;
+});
+
+// Hàm bật camera và gửi frame
+function startCamera(deviceId, viewerId) {
+    if (isCamera) return;
+    isCamera = true;
+
+    socket.emit('register_device', { device_id: deviceId });
+    console.log('📡 Camera đăng ký device:', deviceId);
+
+    navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+        .then(stream => {
+            localStream = stream;
+            localVideo.srcObject = stream;
+            cameraContainer.style.display = 'block';
+
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.width = 640;
+            canvas.height = 360;
+
+            function sendFrame() {
+                if (!localStream.active) return;
+                ctx.drawImage(localVideo, 0, 0, canvas.width, canvas.height);
+                canvas.toBlob(blob => {
+                    if (!blob) return;
+                    blob.arrayBuffer().then(buf => {
+                        socket.emit('frame_binary', {
+                            frame: buf,
+                            device_id: deviceId,
+                            sender_id: String(userId),
+                            target_id: String(viewerId)
                         });
-                    }
-                };
-
-                peerConnections[deviceId].ontrack = event => {
-                    remoteVideo.srcObject = event.streams[0];
-                };
-                peerConnections[deviceId].ontrack = event => {
-                    console.log(`✅ Nhận track từ thiết bị ${deviceId}`, event.streams[0]);
-                    remoteVideo.srcObject = event.streams[0];
-                };
-            }
-            return peerConnections[deviceId];
-        }
-
-        async function startViewerStream(deviceId) {
-            console.log(`📺 Bắt đầu xem stream từ thiết bị ${deviceId}`);
-            streamContainer.style.display = 'block';
-            cameraContainer.style.display = 'none';
-
-            const pc = getPeerConnection(deviceId);
-
-            socket.emit('start_stream', { device_id: deviceId, viewer_id: userId });
-
-            socket.off('offer');
-            socket.off('candidate');
-
-            socket.on('offer', (data) => {
-                console.log('Received offer:', data);
-
-                const pc = new RTCPeerConnection(iceServers);
-                pc.setRemoteDescription(new RTCSessionDescription(data.sdp))
-                    .then(() => pc.createAnswer())
-                    .then(answer => {
-                        return pc.setLocalDescription(answer);
-                    })
-                    .then(() => {
-                        console.log('Sending answer back:', pc.localDescription);
-                        socket.emit('offer', {
-                            sdp: pc.localDescription,
-                            room: deviceId,
-                            sender_id: userId
-                        });
-                    })
-                    .catch(console.error);
-                    socket.emit('answer', {
-                        sdp: pc.localDescription,
-                        room: data.room,
-                        target_id: data.sender_id
                     });
-            });
-            socket.on('candidate', (data) => {
-                if (data.room === deviceId) {
-                    pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-                }
-            });
-        }
-
-        async function startCameraStream(deviceId) {
-            try {
-                console.log(`📹 Bắt đầu phát camera từ thiết bị ${deviceId}`);
-
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-                localVideo.srcObject = stream;
-                cameraContainer.style.display = 'block';
-                streamContainer.style.display = 'none';
-
-                const pc = getPeerConnection(deviceId);
-                stream.getTracks().forEach(track => pc.addTrack(track, stream));
-
-                const offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
-
-                socket.emit('offer', {
-                    sdp: pc.localDescription,
-                    room: deviceId,
-                    sender_id: userId
-                });
-
-                socket.off('answer');
-                socket.off('candidate');
-
-                socket.on('answer', async (data) => {
-                    if (data.room === deviceId) {
-                        await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-                    }
-                });
-
-                socket.on('candidate', (data) => {
-                    if (data.room === deviceId) {
-                        pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-                    }
-                });
-
-            } catch (err) {
-                console.error('❌ Không thể mở camera:', err);
+                }, 'image/jpeg', 0.6);
             }
-        }
 
-        socket.on('register_camera_command', (data) => {
-            const deviceId = data.device_id;
-            console.log(`📹 Server yêu cầu đăng ký camera cho thiết bị: ${deviceId}`);
-            registerAsCamera(deviceId);
-        });
-
-        function registerAsCamera(deviceId) {
-            socket.emit('register_device', { user_id: userId, device_id: deviceId });
-
-            socket.once('device_status', (data) => {
-                if (data.device_id === deviceId) {
-                    if (data.is_camera) {
-                        startCameraStream(deviceId);
-                    } else {
-                        alert(data.error || '❌ Thiết bị không phải camera hoặc không sẵn sàng.');
-                    }
-                }
+            const interval = setInterval(sendFrame, 100);
+            localStream.getTracks().forEach(track => {
+                track.addEventListener('ended', () => {
+                    clearInterval(interval);
+                    isCamera = false;
+                });
             });
-        }
-
-        socket.on('start_stream_request', (data) => {
-            console.log(`📹 Nhận yêu cầu phát camera từ server (cho viewer ${data.viewer_id})`);
-            startCameraStream(data.device_id);
-        });
-
-        document.addEventListener('DOMContentLoaded', () => {
-            console.log("✅ Dashboard đã tải và kết nối socket thành công.");
-        });
-    </script>
+        })
+        .catch(err => console.error('❌ Lỗi truy cập camera:', err));
+}
+</script>
 </body>
 </html>
